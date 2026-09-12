@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "joonas.loopdaddyradio",
+  "name": "Loop Daddy Radio",
+  "version": "1.0.0",
+  "author": "joonas",
+  "license": "MIT",
+  "description": "Toggle on to play a random Marc Rebillet session, audio only, from YouTube.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Loop Daddy Radio",
+    "description": "Toggle a random Marc Rebillet radio from YouTube, audio only.",
+    "category": "Media",
+    "aliases": [
+      "loopdaddy",
+      "rebillet",
+      "radio"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
