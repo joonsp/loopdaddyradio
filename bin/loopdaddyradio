@@ -123,7 +123,7 @@ play_track() {
     --vo=null
     --force-window=no
     --audio-display=no
-    --audio-client-name="Loop Daddy Radio"
+    --audio-client-name=loopdaddyradio
     --ytdl-format=bestaudio/best
     --really-quiet
     --no-terminal
