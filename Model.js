@@ -1,18 +1,25 @@
 function parseCatalog(raw) {
+  var text = String(raw || "")
+  if (text.length > 524288) return { ok: false, lastError: "Catalog too large" }
   try {
-    var data = JSON.parse(String(raw || "").trim())
+    var data = JSON.parse(text.trim())
   } catch (e) {
     return { ok: false, lastError: "Could not parse catalog" }
   }
   if (!data || typeof data !== "object" || !Array.isArray(data.tracks))
     return { ok: false, lastError: "Catalog is empty" }
   var tracks = []
-  for (var i = 0; i < data.tracks.length; i++) {
+  var idRe = /^[A-Za-z0-9_-]{8,16}$/
+  for (var i = 0; i < data.tracks.length && tracks.length < 1500; i++) {
     var track = data.tracks[i]
     if (!track || !track.id) continue
+    var id = String(track.id)
+    if (!idRe.test(id)) continue
+    var title = String(track.title || "Untitled")
+    if (title.length > 200) title = title.substring(0, 200)
     tracks.push({
-      id: String(track.id),
-      title: String(track.title || "Untitled"),
+      id: id,
+      title: title,
       duration: Number(track.duration || 0)
     })
   }

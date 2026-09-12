@@ -1,16 +1,49 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Catalog and audio-only playback helper for the Loop Daddy Radio Omarchy plugin.
 set -euo pipefail
+umask 077
 
-CHANNEL="${LOOPDADDY_CHANNEL:-https://www.youtube.com/@MarcRebillet}"
-STATE_DIR="${LOOPDADDY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/loopdaddyradio}"
-CACHE="$STATE_DIR/catalog.json"
-ENABLED_FILE="$STATE_DIR/enabled"
-MIN_DURATION="${LOOPDADDY_MIN_DURATION:-90}"
-MAX_AGE="${LOOPDADDY_CACHE_MAX_AGE:-86400}"
+# Inherited PATH/env is untrusted: a shadowed binary would run inside the
+# long-lived shell. Use a closed environment and absolute executables only.
+unset BASH_ENV ENV CDPATH
+unset LOOPDADDY_CHANNEL LOOPDADDY_STATE_DIR LOOPDADDY_MIN_DURATION LOOPDADDY_CACHE_MAX_AGE
+PATH=/usr/bin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+
+readonly BASH_BIN=/bin/bash
+readonly CAT=/usr/bin/cat
+readonly CHMOD=/usr/bin/chmod
+readonly DATE=/usr/bin/date
+readonly ENV=/usr/bin/env
+readonly HEAD=/usr/bin/head
+readonly ID=/usr/bin/id
+readonly JQ=/usr/bin/jq
+readonly MKDIR=/usr/bin/mkdir
+readonly MKTEMP=/usr/bin/mktemp
+readonly MPV=/usr/bin/mpv
+readonly MV=/usr/bin/mv
+readonly PRINTF=/usr/bin/printf
+readonly REALPATH=/usr/bin/realpath
+readonly RM=/usr/bin/rm
+readonly STAT=/usr/bin/stat
+readonly TIMEOUT=/usr/bin/timeout
+readonly TR=/usr/bin/tr
+readonly YT_DLP=/usr/bin/yt-dlp
+
+readonly CHANNEL='https://www.youtube.com/@MarcRebillet'
+readonly MIN_DURATION=90
+readonly MAX_AGE=86400
+readonly MAX_CATALOG_BYTES=524288
+readonly MAX_CATALOG_LINES=2000
+readonly MAX_TRACKS=1500
+readonly MAX_ENABLED_BYTES=8
+readonly CATALOG_TIMEOUT=180
+readonly CATALOG_KILL_AFTER=5
 
 usage() {
-  cat <<'USAGE'
+  "$CAT" <<'USAGE'
 Usage:
   loopdaddyradio catalog [--refresh]   Print the cached track catalog as JSON
   loopdaddyradio play <id> [title] [start]   Play one YouTube video, audio only
@@ -20,68 +53,260 @@ USAGE
 }
 
 fail() {
-  echo "loopdaddyradio: $*" >&2
+  "$PRINTF" 'loopdaddyradio: %s\n' "$*" >&2
   exit 1
 }
 
-need() {
-  command -v "$1" >/dev/null 2>&1 || fail "missing dependency: $1"
+require_exe() {
+  local p=$1
+  local real
+  [[ $p == /* ]] || fail "refusing relative executable: $p"
+  [[ -x $p ]] || fail "missing dependency: $p"
+  real=$("$REALPATH" -e -- "$p") || fail "cannot resolve: $p"
+  case "$real" in
+    /usr/bin/*|/bin/*) ;;
+    *) fail "executable is outside /usr/bin or /bin: $p -> $real" ;;
+  esac
+  [[ -f $real && -x $real ]] || fail "not an executable file: $real"
 }
 
+require_exe "$BASH_BIN"
+require_exe "$CAT"
+require_exe "$CHMOD"
+require_exe "$DATE"
+require_exe "$ENV"
+require_exe "$HEAD"
+require_exe "$ID"
+require_exe "$JQ"
+require_exe "$MKDIR"
+require_exe "$MKTEMP"
+require_exe "$MPV"
+require_exe "$MV"
+require_exe "$PRINTF"
+require_exe "$REALPATH"
+require_exe "$RM"
+require_exe "$STAT"
+require_exe "$TIMEOUT"
+require_exe "$TR"
+require_exe "$YT_DLP"
+
+home_dir() {
+  local home=${HOME-}
+  [[ $home == /* ]] || fail "HOME must be an absolute path"
+  [[ ! -L $home ]] || fail "refusing symlink HOME: $home"
+  [[ -d $home ]] || fail "HOME is not a directory"
+  "$PRINTF" '%s' "$home"
+}
+
+# Create or reuse a directory. Never follow a symlink at the final component.
+ensure_dir_nofollow() {
+  local path=$1
+  local mode=${2-}
+  if [[ -L $path ]]; then
+    fail "refusing symlink: $path"
+  fi
+  if [[ -e $path ]]; then
+    [[ -d $path ]] || fail "not a directory: $path"
+    return 0
+  fi
+  if [[ -n $mode ]]; then
+    "$MKDIR" -m "$mode" -- "$path" || fail "mkdir $path"
+  else
+    "$MKDIR" -- "$path" || fail "mkdir $path"
+  fi
+  [[ ! -L $path && -d $path ]] || fail "mkdir raced to a non-directory: $path"
+}
+
+STATE_DIR=""
+CACHE=""
+ENABLED_FILE=""
+
 ensure_state_dir() {
-  mkdir -p "$STATE_DIR"
+  local home localdir statedir uid owner
+  home=$(home_dir)
+  localdir="$home/.local"
+  statedir="$localdir/state"
+  STATE_DIR="$statedir/loopdaddyradio"
+  CACHE="$STATE_DIR/catalog.json"
+  ENABLED_FILE="$STATE_DIR/enabled"
+
+  ensure_dir_nofollow "$localdir"
+  ensure_dir_nofollow "$statedir"
+  ensure_dir_nofollow "$STATE_DIR" 0700
+
+  uid=$("$ID" -u)
+  owner=$("$STAT" -c '%u' -- "$STATE_DIR")
+  [[ $owner == "$uid" ]] || fail "state directory is not owned by the current user"
+  "$CHMOD" 0700 -- "$STATE_DIR"
+  [[ ! -L $STATE_DIR && -d $STATE_DIR ]] || fail "state directory became unsafe"
+  # Remove crashed writes and leftover temps from older helper versions.
+  "$RM" -f -- "$STATE_DIR"/.tmp.* "$STATE_DIR"/catalog.??????
+}
+
+refuse_symlink() {
+  local path=$1
+  [[ ! -L $path ]] || fail "refusing symlink: $path"
+}
+
+# stdin -> dest, max bytes, mode 0600, randomized temp, no symlink follow, atomic replace.
+write_capped_file() {
+  local dest=$1
+  local max=$2
+  local tmp size
+  ensure_state_dir
+  refuse_symlink "$dest"
+  tmp=$("$MKTEMP" -p "$STATE_DIR" '.tmp.XXXXXX') || fail "mktemp"
+  "$CHMOD" 0600 -- "$tmp"
+  if ! "$HEAD" -c "$((max + 1))" > "$tmp"; then
+    "$RM" -f -- "$tmp"
+    fail "failed to write temp file"
+  fi
+  size=$("$STAT" -c '%s' -- "$tmp")
+  if (( size > max )); then
+    "$RM" -f -- "$tmp"
+    fail "write exceeded $max bytes"
+  fi
+  refuse_symlink "$dest"
+  "$MV" -f -- "$tmp" "$dest"
+  "$CHMOD" 0600 -- "$dest"
+}
+
+read_capped_file() {
+  local src=$1
+  local max=$2
+  local size
+  [[ -e $src ]] || return 1
+  refuse_symlink "$src"
+  [[ -f $src ]] || fail "not a regular file: $src"
+  size=$("$STAT" -c '%s' -- "$src")
+  (( size <= max )) || fail "file too large: $src"
+  "$HEAD" -c "$max" -- "$src"
 }
 
 cache_age() {
-  if [[ ! -f $CACHE ]]; then
+  local now mtime
+  if [[ ! -e $CACHE ]]; then
     echo 999999
     return
   fi
-  echo $(( $(date +%s) - $(stat -c %Y "$CACHE") ))
+  refuse_symlink "$CACHE"
+  [[ -f $CACHE ]] || fail "catalog cache is not a regular file"
+  now=$("$DATE" +%s)
+  mtime=$("$STAT" -c '%Y' -- "$CACHE")
+  echo $(( now - mtime ))
+}
+
+# Bound yt-dlp stdout by lines and bytes; fail closed if either ceiling is hit.
+cap_stream() {
+  local max_bytes=$1
+  local max_lines=$2
+  local bytes=0
+  local lines=0
+  local line
+  while IFS= read -r line || [[ -n ${line-} ]]; do
+    lines=$((lines + 1))
+    bytes=$((bytes + ${#line} + 1))
+    if (( lines > max_lines || bytes > max_bytes )); then
+      fail "catalog stream exceeded limits"
+    fi
+    "$PRINTF" '%s\n' "$line"
+  done
 }
 
 refresh_catalog() {
-  need yt-dlp
-  need jq
+  local tmp size count yt_status cap_status jq_status
   ensure_state_dir
-  local tmp
-  tmp=$(mktemp "$STATE_DIR/catalog.XXXXXX")
-  yt-dlp \
-    --flat-playlist \
-    --no-warnings \
-    --ignore-errors \
-    --print "%(.{id,title,duration,live_status,was_live})j" \
-    "$CHANNEL/videos" \
-    "$CHANNEL/streams" \
-    | jq -s \
+  tmp=$("$MKTEMP" -p "$STATE_DIR" '.tmp.XXXXXX') || fail "mktemp"
+  "$CHMOD" 0600 -- "$tmp"
+
+  set +e
+  "$TIMEOUT" --signal=TERM --kill-after="${CATALOG_KILL_AFTER}s" "${CATALOG_TIMEOUT}s" \
+    "$YT_DLP" \
+      --ignore-config \
+      --flat-playlist \
+      --no-warnings \
+      --ignore-errors \
+      --playlist-end "$MAX_TRACKS" \
+      --print '%(.{id,title,duration,live_status,was_live})j' \
+      -- \
+      "${CHANNEL}/videos" \
+      "${CHANNEL}/streams" \
+    | cap_stream "$MAX_CATALOG_BYTES" "$MAX_CATALOG_LINES" \
+    | "$JQ" -Rn \
       --arg channel "$CHANNEL" \
       --argjson min "$MIN_DURATION" \
+      --argjson max "$MAX_TRACKS" \
       '
-      unique_by(.id)
-      | map(select(
-          (.id | type == "string") and (.id | length) > 0
-          and (.live_status != "is_live")
-          and (.live_status != "is_upcoming")
-          and ((.duration | type) == "number")
-          and (.duration >= $min)
-        ))
+      def ok($t):
+        ($t.id | type == "string")
+        and ($t.id | test("^[A-Za-z0-9_-]{8,16}$"))
+        and ($t.live_status != "is_live")
+        and ($t.live_status != "is_upcoming")
+        and (($t.duration | type) == "number")
+        and ($t.duration >= $min);
+      reduce inputs as $line ({seen: {}, tracks: []};
+        try (
+          ($line | fromjson) as $t
+          | if (.tracks | length) >= $max then .
+            elif ok($t) and (.seen[$t.id] | not) then
+              .seen[$t.id] = true
+              | .tracks += [{
+                  id: $t.id,
+                  title: (($t.title // "Untitled") | tostring | .[0:200]),
+                  duration: $t.duration
+                }]
+            else .
+            end
+        ) catch .
+      )
       | {
           channel: $channel,
           fetchedAt: (now | floor),
-          tracks: map({id, title: (.title // "Untitled"), duration})
+          tracks: .tracks
         }
       ' > "$tmp"
-  local count
-  count=$(jq '.tracks | length' "$tmp")
-  [[ ${count:-0} -gt 0 ]] || { rm -f "$tmp"; fail "catalog refresh returned no playable tracks"; }
-  mv "$tmp" "$CACHE"
+  yt_status=${PIPESTATUS[0]} cap_status=${PIPESTATUS[1]} jq_status=${PIPESTATUS[2]}
+  set -e
+
+  if (( yt_status == 124 || yt_status == 137 )); then
+    "$RM" -f -- "$tmp"
+    fail "catalog refresh timed out"
+  fi
+  if (( cap_status != 0 )); then
+    "$RM" -f -- "$tmp"
+    fail "catalog stream exceeded limits"
+  fi
+  if (( jq_status != 0 )); then
+    "$RM" -f -- "$tmp"
+    fail "catalog parse failed"
+  fi
+  if (( yt_status != 0 )); then
+    "$RM" -f -- "$tmp"
+    fail "catalog refresh failed"
+  fi
+  if [[ ! -s $tmp ]]; then
+    "$RM" -f -- "$tmp"
+    fail "catalog refresh returned no data"
+  fi
+  size=$("$STAT" -c '%s' -- "$tmp")
+  if (( size > MAX_CATALOG_BYTES )); then
+    "$RM" -f -- "$tmp"
+    fail "catalog JSON exceeded $MAX_CATALOG_BYTES bytes"
+  fi
+  count=$("$JQ" '.tracks | length' "$tmp")
+  [[ ${count:-0} -gt 0 ]] || { "$RM" -f -- "$tmp"; fail "catalog refresh returned no playable tracks"; }
+
+  refuse_symlink "$CACHE"
+  "$MV" -f -- "$tmp" "$CACHE"
+  "$CHMOD" 0600 -- "$CACHE"
 }
 
 print_catalog() {
   local refresh="${1:-}"
+  ensure_state_dir
   if [[ $refresh == --refresh ]]; then
     refresh_catalog
-  elif [[ ! -f $CACHE ]]; then
+  elif [[ ! -e $CACHE ]]; then
     refresh_catalog
   else
     local age
@@ -90,35 +315,63 @@ print_catalog() {
       refresh_catalog
     fi
   fi
-  cat "$CACHE"
+  read_capped_file "$CACHE" "$MAX_CATALOG_BYTES" || fail "catalog cache missing"
 }
 
 mpris_script() {
-  local candidate
+  local candidate real
   for candidate in \
     /usr/lib/mpv-mpris/mpris.so \
     /etc/mpv/scripts/mpris.so \
     /usr/lib/mpv/scripts/mpris.so
   do
-    if [[ -f $candidate ]]; then
-      echo "$candidate"
-      return 0
-    fi
+    [[ -e $candidate ]] || continue
+    real=$("$REALPATH" -e -- "$candidate") || continue
+    case "$real" in
+      /usr/lib/mpv-mpris/*|/usr/lib/mpv/scripts/*|/etc/mpv/scripts/*) ;;
+      *) continue ;;
+    esac
+    [[ -f $real && -r $real ]] || continue
+    "$PRINTF" '%s' "$real"
+    return 0
   done
   return 1
+}
+
+runtime_dir() {
+  local uid dir
+  uid=$("$ID" -u)
+  dir=/run/user/"$uid"
+  [[ -d $dir && ! -L $dir ]] || return 1
+  "$PRINTF" '%s' "$dir"
 }
 
 play_track() {
   local id="${1:-}"
   local title="${2:-Loop Daddy Radio}"
   local start="${3:-0}"
-  [[ -n $id ]] || fail "play requires a YouTube video id"
-  [[ $start =~ ^[0-9]+$ ]] || fail "start must be a whole number of seconds"
-  need mpv
-  need yt-dlp
+  local mpris=""
+  local runtime=""
+  local dbus=${DBUS_SESSION_BUS_ADDRESS-}
+  local uid
+  [[ $id =~ ^[A-Za-z0-9_-]{8,16}$ ]] || fail "play requires a YouTube video id"
+  [[ $start =~ ^[0-9]{1,7}$ ]] || fail "start must be a whole number of seconds"
+  (( 10#$start <= 864000 )) || fail "start is too large"
+  title=${title//[$'\n\r\t']/ }
+  title=${title:0:200}
+  [[ -n $title ]] || title="Loop Daddy Radio"
+
+  uid=$("$ID" -u)
+  runtime=$(runtime_dir || true)
+  if [[ -n $dbus && $dbus != unix:path=/run/user/"$uid"/* ]]; then
+    dbus=""
+  fi
+
   local args=(
     --no-config
     --ytdl=yes
+    --script-opts=ytdl_hook-ytdl_path="$YT_DLP"
+    --ytdl-raw-options=ignore-config=
     --no-video
     --vo=null
     --force-window=no
@@ -132,31 +385,52 @@ play_track() {
     --cache=yes
     --start="$start"
     --force-media-title="$title"
-    --title="Loop Daddy Radio"
+    --title=loopdaddyradio
     --osd-playing-msg=
   )
-  local mpris=""
   mpris=$(mpris_script || true)
   if [[ -n $mpris ]]; then
     args+=(--script="$mpris")
   fi
-  exec mpv "${args[@]}" "https://www.youtube.com/watch?v=${id}"
+
+  local env_args=(
+    "$ENV" -i
+    PATH=/usr/bin:/bin
+    HOME="$(home_dir)"
+    LANG=C.UTF-8
+    LC_ALL=C.UTF-8
+  )
+  if [[ -n $runtime ]]; then
+    env_args+=(XDG_RUNTIME_DIR="$runtime")
+  fi
+  if [[ -n $dbus ]]; then
+    env_args+=(DBUS_SESSION_BUS_ADDRESS="$dbus")
+  fi
+
+  exec "${env_args[@]}" "$MPV" "${args[@]}" -- "https://www.youtube.com/watch?v=${id}"
 }
 
 enabled_state() {
   local value="${1:-}"
+  local current
   ensure_state_dir
   if [[ -z $value ]]; then
-    if [[ -f $ENABLED_FILE ]]; then
-      tr -d '[:space:]' < "$ENABLED_FILE"
-      echo
+    if [[ -e $ENABLED_FILE ]]; then
+      current=$(read_capped_file "$ENABLED_FILE" "$MAX_ENABLED_BYTES" || true)
+      current=$("$TR" -d '[:space:]' <<< "${current-}")
+      case "$current" in
+        on|off) "$PRINTF" '%s\n' "$current" ;;
+        *) echo off ;;
+      esac
     else
       echo off
     fi
     return
   fi
   case "$value" in
-    on|off) printf '%s\n' "$value" > "$ENABLED_FILE" ;;
+    on|off)
+      "$PRINTF" '%s\n' "$value" | write_capped_file "$ENABLED_FILE" "$MAX_ENABLED_BYTES"
+      ;;
     *) fail "enabled must be on or off" ;;
   esac
 }

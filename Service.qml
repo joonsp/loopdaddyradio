@@ -23,6 +23,8 @@ Item {
   property var currentTrack: null
   property int fetchedAt: 0
   property bool randomStart: false
+  property string playErrTail: ""
+  property string catalogErrTail: ""
 
   readonly property string title: currentTrack ? String(currentTrack.title || "") : ""
   readonly property string videoId: currentTrack ? String(currentTrack.id || "") : ""
@@ -44,6 +46,13 @@ Item {
     return catalogReady
   }
 
+  function clipTail(prev, chunk, maxBytes) {
+    var s = String(prev || "") + String(chunk || "")
+    var cap = Math.max(64, Number(maxBytes) || 400)
+    if (s.length > cap) s = s.substring(s.length - cap)
+    return s
+  }
+
   function persistEnabled() {
     if (persistProc.running) return
     persistProc.command = [cli, "enabled", root.on ? "on" : "off"]
@@ -52,8 +61,29 @@ Item {
 
   function loadCatalog(force) {
     if (catalogProc.running) return
+    catalogErrTail = ""
     catalogProc.command = force ? [cli, "catalog", "--refresh"] : [cli, "catalog"]
     catalogProc.running = true
+    catalogTermTimer.restart()
+  }
+
+  function stopCatalog() {
+    catalogTermTimer.stop()
+    if (!catalogProc.running) {
+      catalogKillTimer.stop()
+      return
+    }
+    catalogProc.signal(15)
+    catalogKillTimer.restart()
+  }
+
+  function stopPlay() {
+    if (!playProc.running) {
+      playKillTimer.stop()
+      return
+    }
+    playProc.signal(15)
+    playKillTimer.restart()
   }
 
   function playTrack(track, startSeconds) {
@@ -61,6 +91,7 @@ Item {
     currentTrack = track
     recentIds = Model.rememberId(recentIds, track.id, 24)
     lastError = ""
+    playErrTail = ""
     loading = true
     var start = Math.max(0, Math.floor(Number(startSeconds) || 0))
     var cmd = [cli, "play", String(track.id), String(track.title || "Loop Daddy Radio")]
@@ -78,7 +109,7 @@ Item {
       return
     }
     if (playProc.running) {
-      playProc.running = false
+      stopPlay()
       return
     }
     var track = Model.pickTrack(tracks, recentIds)
@@ -112,7 +143,7 @@ Item {
       currentTrack = null
       root.randomStart = false
       stopping = playProc.running
-      if (playProc.running) playProc.running = false
+      stopPlay()
       return
     }
     root.randomStart = true
@@ -158,6 +189,7 @@ Item {
       onStreamFinished: {
         root.persistReady = true
         var value = String(text || "").trim()
+        if (value.length > 8) value = value.substring(0, 8)
         if (value === "on") root.setOn(true)
       }
     }
@@ -177,17 +209,28 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var ok = root.applyCatalog(text)
+        var raw = String(text || "")
+        if (raw.length > 524288) {
+          root.lastError = "Catalog too large"
+          root.loading = false
+          return
+        }
+        var ok = root.applyCatalog(raw)
         if (root.on && ok && !playProc.running) root.playNext()
       }
     }
-    stderr: StdioCollector {
-      id: catalogErr
-      waitForEnd: true
+    stderr: SplitParser {
+      onRead: function(data) {
+        root.catalogErrTail = root.clipTail(root.catalogErrTail, data, 400)
+      }
     }
+    onStarted: catalogTermTimer.restart()
     onExited: function(exitCode) {
+      catalogTermTimer.stop()
+      catalogKillTimer.stop()
       if (exitCode !== 0 && !root.catalogReady) {
-        root.lastError = String(catalogErr.text || "Catalog failed").trim()
+        var err = String(root.catalogErrTail || "").trim()
+        root.lastError = err || "Catalog failed"
         root.loading = false
       }
     }
@@ -197,13 +240,15 @@ Item {
     id: playProc
     running: false
     command: []
-    stderr: StdioCollector {
-      id: playErr
-      waitForEnd: true
+    stderr: SplitParser {
+      onRead: function(data) {
+        root.playErrTail = root.clipTail(root.playErrTail, data, 400)
+      }
     }
     onExited: function(exitCode) {
       root.loading = false
       startedTimer.stop()
+      playKillTimer.stop()
       if (root.stopping) {
         root.stopping = false
         root.currentTrack = null
@@ -214,7 +259,7 @@ Item {
         return
       }
       if (exitCode !== 0) {
-        var err = String(playErr.text || "").trim()
+        var err = String(root.playErrTail || "").trim()
         if (err) root.lastError = err
       }
       retryTimer.restart()
@@ -241,6 +286,27 @@ Item {
     repeat: true
     running: true
     onTriggered: root.loadCatalog(true)
+  }
+
+  Timer {
+    id: catalogTermTimer
+    interval: 180000
+    repeat: false
+    onTriggered: root.stopCatalog()
+  }
+
+  Timer {
+    id: catalogKillTimer
+    interval: 5000
+    repeat: false
+    onTriggered: if (catalogProc.running) catalogProc.signal(9)
+  }
+
+  Timer {
+    id: playKillTimer
+    interval: 1000
+    repeat: false
+    onTriggered: if (playProc.running) playProc.signal(9)
   }
 
   Component.onCompleted: loadCatalog(false)
