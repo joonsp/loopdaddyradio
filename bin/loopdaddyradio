@@ -93,6 +93,21 @@ print_catalog() {
   cat "$CACHE"
 }
 
+mpris_script() {
+  local candidate
+  for candidate in \
+    /usr/lib/mpv-mpris/mpris.so \
+    /etc/mpv/scripts/mpris.so \
+    /usr/lib/mpv/scripts/mpris.so
+  do
+    if [[ -f $candidate ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 play_track() {
   local id="${1:-}"
   local title="${2:-Loop Daddy Radio}"
@@ -101,24 +116,31 @@ play_track() {
   [[ $start =~ ^[0-9]+$ ]] || fail "start must be a whole number of seconds"
   need mpv
   need yt-dlp
-  exec mpv \
-    --no-config \
-    --ytdl=yes \
-    --no-video \
-    --vo=null \
-    --force-window=no \
-    --audio-display=no \
-    --ytdl-format=bestaudio/best \
-    --really-quiet \
-    --no-terminal \
-    --keep-open=no \
-    --loop-file=no \
-    --cache=yes \
-    --start="$start" \
-    --force-media-title="$title" \
-    --title="Loop Daddy Radio" \
-    --osd-playing-msg= \
-    "https://www.youtube.com/watch?v=${id}"
+  local args=(
+    --no-config
+    --ytdl=yes
+    --no-video
+    --vo=null
+    --force-window=no
+    --audio-display=no
+    --audio-client-name="Loop Daddy Radio"
+    --ytdl-format=bestaudio/best
+    --really-quiet
+    --no-terminal
+    --keep-open=no
+    --loop-file=no
+    --cache=yes
+    --start="$start"
+    --force-media-title="$title"
+    --title="Loop Daddy Radio"
+    --osd-playing-msg=
+  )
+  local mpris=""
+  mpris=$(mpris_script || true)
+  if [[ -n $mpris ]]; then
+    args+=(--script="$mpris")
+  fi
+  exec mpv "${args[@]}" "https://www.youtube.com/watch?v=${id}"
 }
 
 enabled_state() {
