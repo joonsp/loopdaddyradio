@@ -24,6 +24,7 @@ readonly MKDIR=/usr/bin/mkdir
 readonly MKTEMP=/usr/bin/mktemp
 readonly MPV=/usr/bin/mpv
 readonly MV=/usr/bin/mv
+readonly NC=/usr/bin/nc
 readonly PRINTF=/usr/bin/printf
 readonly REALPATH=/usr/bin/realpath
 readonly RM=/usr/bin/rm
@@ -39,8 +40,12 @@ readonly MAX_CATALOG_BYTES=524288
 readonly MAX_CATALOG_LINES=2000
 readonly MAX_TRACKS=1500
 readonly MAX_ENABLED_BYTES=8
+readonly MAX_BOOT_BYTES=64
 readonly CATALOG_TIMEOUT=180
 readonly CATALOG_KILL_AFTER=5
+readonly LIVE_TIMEOUT=25
+readonly LIVE_KILL_AFTER=5
+readonly IPC_TIMEOUT=1
 
 usage() {
   "$CAT" <<'USAGE'
@@ -49,6 +54,10 @@ Usage:
   loopdaddyradio play <id> [title] [start]   Play one YouTube video, audio only
                                              Optional start is seconds from the beginning
   loopdaddyradio enabled [on|off]      Read or write the persisted on/off flag
+  loopdaddyradio restore               Print play, resume, or off for startup
+  loopdaddyradio live                  Print current live session JSON, or {"live":false}
+  loopdaddyradio ctl <pause|unpause|toggle-pause|status>
+                                       Control or query the running player
 USAGE
 }
 
@@ -82,6 +91,7 @@ require_exe "$MKDIR"
 require_exe "$MKTEMP"
 require_exe "$MPV"
 require_exe "$MV"
+require_exe "$NC"
 require_exe "$PRINTF"
 require_exe "$REALPATH"
 require_exe "$RM"
@@ -120,6 +130,7 @@ ensure_dir_nofollow() {
 STATE_DIR=""
 CACHE=""
 ENABLED_FILE=""
+BOOT_FILE=""
 
 ensure_state_dir() {
   local home localdir statedir uid owner
@@ -129,6 +140,7 @@ ensure_state_dir() {
   STATE_DIR="$statedir/loopdaddyradio"
   CACHE="$STATE_DIR/catalog.json"
   ENABLED_FILE="$STATE_DIR/enabled"
+  BOOT_FILE="$STATE_DIR/boot-id"
 
   ensure_dir_nofollow "$localdir"
   ensure_dir_nofollow "$statedir"
@@ -237,17 +249,26 @@ refresh_catalog() {
       --argjson min "$MIN_DURATION" \
       --argjson max "$MAX_TRACKS" \
       '
-      def ok($t):
+      def okid($t):
         ($t.id | type == "string")
-        and ($t.id | test("^[A-Za-z0-9_-]{8,16}$"))
+        and ($t.id | test("^[A-Za-z0-9_-]{8,16}$"));
+      def ok($t):
+        okid($t)
         and ($t.live_status != "is_live")
         and ($t.live_status != "is_upcoming")
         and (($t.duration | type) == "number")
         and ($t.duration >= $min);
-      reduce inputs as $line ({seen: {}, tracks: []};
+      reduce inputs as $line ({seen: {}, tracks: [], live: null};
         try (
           ($line | fromjson) as $t
-          | if (.tracks | length) >= $max then .
+          | if okid($t) and ($t.live_status == "is_live") and (.live == null) then
+              .live = {
+                id: $t.id,
+                title: (($t.title // "Live") | tostring | .[0:200]),
+                duration: 0,
+                live: true
+              }
+            elif (.tracks | length) >= $max then .
             elif ok($t) and (.seen[$t.id] | not) then
               .seen[$t.id] = true
               | .tracks += [{
@@ -262,6 +283,7 @@ refresh_catalog() {
       | {
           channel: $channel,
           fetchedAt: (now | floor),
+          live: .live,
           tracks: .tracks
         }
       ' > "$tmp"
@@ -346,6 +368,58 @@ runtime_dir() {
   "$PRINTF" '%s' "$dir"
 }
 
+ipc_dir() {
+  local runtime
+  runtime=$(runtime_dir) || return 1
+  "$PRINTF" '%s' "$runtime/loopdaddyradio"
+}
+
+ipc_socket() {
+  local dir
+  dir=$(ipc_dir) || return 1
+  "$PRINTF" '%s' "$dir/mpv.sock"
+}
+
+current_boot_id() {
+  local id
+  [[ -e /proc/sys/kernel/random/boot_id ]] || fail "boot id is missing"
+  id=$("$HEAD" -c "$MAX_BOOT_BYTES" -- /proc/sys/kernel/random/boot_id)
+  id=$("$TR" -d '[:space:]' <<< "${id-}")
+  [[ $id =~ ^[A-Za-z0-9-]{8,64}$ ]] || fail "invalid boot id"
+  "$PRINTF" '%s' "$id"
+}
+
+write_boot_id() {
+  ensure_state_dir
+  current_boot_id | write_capped_file "$BOOT_FILE" "$MAX_BOOT_BYTES"
+}
+
+read_boot_id() {
+  local id
+  [[ -e $BOOT_FILE ]] || return 1
+  id=$(read_capped_file "$BOOT_FILE" "$MAX_BOOT_BYTES" || true)
+  id=$("$TR" -d '[:space:]' <<< "${id-}")
+  [[ $id =~ ^[A-Za-z0-9-]{8,64}$ ]] || return 1
+  "$PRINTF" '%s' "$id"
+}
+
+restore_intent() {
+  local enabled last current
+  ensure_state_dir
+  enabled=$(read_enabled)
+  if [[ $enabled != on ]]; then
+    "$PRINTF" '%s\n' off
+    return
+  fi
+  current=$(current_boot_id)
+  last=$(read_boot_id || true)
+  if [[ -n $last && $last == "$current" ]]; then
+    "$PRINTF" '%s\n' play
+  else
+    "$PRINTF" '%s\n' resume
+  fi
+}
+
 play_track() {
   local id="${1:-}"
   local title="${2:-Loop Daddy Radio}"
@@ -365,6 +439,18 @@ play_track() {
   runtime=$(runtime_dir || true)
   if [[ -n $dbus && $dbus != unix:path=/run/user/"$uid"/* ]]; then
     dbus=""
+  fi
+
+  local sock=""
+  if [[ -n $runtime ]]; then
+    local sockdir="$runtime/loopdaddyradio"
+    ensure_dir_nofollow "$sockdir" 0700
+    sock="$sockdir/mpv.sock"
+    refuse_symlink "$sock"
+    if [[ -e $sock ]]; then
+      [[ -S $sock ]] || fail "mpv ipc path is not a socket"
+      "$RM" -f -- "$sock"
+    fi
   fi
 
   local args=(
@@ -392,6 +478,9 @@ play_track() {
   if [[ -n $mpris ]]; then
     args+=(--script="$mpris")
   fi
+  if [[ -n $sock ]]; then
+    args+=(--input-ipc-server="$sock")
+  fi
 
   local env_args=(
     "$ENV" -i
@@ -410,28 +499,140 @@ play_track() {
   exec "${env_args[@]}" "$MPV" "${args[@]}" -- "https://www.youtube.com/watch?v=${id}"
 }
 
-enabled_state() {
-  local value="${1:-}"
+read_enabled() {
   local current
   ensure_state_dir
+  if [[ -e $ENABLED_FILE ]]; then
+    current=$(read_capped_file "$ENABLED_FILE" "$MAX_ENABLED_BYTES" || true)
+    current=$("$TR" -d '[:space:]' <<< "${current-}")
+    case "$current" in
+      on|off) "$PRINTF" '%s' "$current" ;;
+      *) "$PRINTF" '%s' off ;;
+    esac
+  else
+    "$PRINTF" '%s' off
+  fi
+}
+
+enabled_state() {
+  local value="${1:-}"
+  ensure_state_dir
   if [[ -z $value ]]; then
-    if [[ -e $ENABLED_FILE ]]; then
-      current=$(read_capped_file "$ENABLED_FILE" "$MAX_ENABLED_BYTES" || true)
-      current=$("$TR" -d '[:space:]' <<< "${current-}")
-      case "$current" in
-        on|off) "$PRINTF" '%s\n' "$current" ;;
-        *) echo off ;;
-      esac
-    else
-      echo off
-    fi
+    "$PRINTF" '%s\n' "$(read_enabled)"
     return
   fi
   case "$value" in
-    on|off)
-      "$PRINTF" '%s\n' "$value" | write_capped_file "$ENABLED_FILE" "$MAX_ENABLED_BYTES"
+    on)
+      "$PRINTF" '%s\n' on | write_capped_file "$ENABLED_FILE" "$MAX_ENABLED_BYTES"
+      write_boot_id
+      ;;
+    off)
+      "$PRINTF" '%s\n' off | write_capped_file "$ENABLED_FILE" "$MAX_ENABLED_BYTES"
       ;;
     *) fail "enabled must be on or off" ;;
+  esac
+}
+
+print_not_live() {
+  "$PRINTF" '%s\n' '{"live":false}'
+}
+
+print_live() {
+  local tmp size
+  ensure_state_dir
+  tmp=$("$MKTEMP" -p "$STATE_DIR" '.tmp.XXXXXX') || fail "mktemp"
+  "$CHMOD" 0600 -- "$tmp"
+
+  set +e
+  "$TIMEOUT" --signal=TERM --kill-after="${LIVE_KILL_AFTER}s" "${LIVE_TIMEOUT}s" \
+    "$YT_DLP" \
+      --ignore-config \
+      --no-warnings \
+      --ignore-errors \
+      --skip-download \
+      --playlist-end 1 \
+      --print '%(.{id,title,duration,live_status})j' \
+      -- \
+      "${CHANNEL}/live" \
+    | "$HEAD" -c 8192 \
+    > "$tmp"
+  set -e
+
+  if [[ ! -s $tmp ]]; then
+    "$RM" -f -- "$tmp"
+    print_not_live
+    return
+  fi
+  size=$("$STAT" -c '%s' -- "$tmp")
+  if (( size > 8192 )); then
+    "$RM" -f -- "$tmp"
+    print_not_live
+    return
+  fi
+
+  "$JQ" -c '
+    def okid:
+      type == "string" and test("^[A-Za-z0-9_-]{8,16}$");
+    (try input catch null) as $t
+    | if ($t | type) == "object"
+        and ($t.live_status == "is_live")
+        and ($t.id | okid)
+      then
+        {
+          id: $t.id,
+          title: (($t.title // "Live") | tostring | .[0:200]),
+          duration: 0,
+          live: true
+        }
+      else
+        {live: false}
+      end
+  ' "$tmp" || print_not_live
+  "$RM" -f -- "$tmp"
+}
+
+ipc_send() {
+  local sock json
+  sock=$(ipc_socket) || fail "player is not running"
+  refuse_symlink "$sock"
+  [[ -S $sock ]] || fail "player is not running"
+  json=$1
+  "$PRINTF" '%s\n' "$json" | "$NC" -U -N -w "$IPC_TIMEOUT" "$sock"
+}
+
+ctl_player() {
+  local action="${1:-}"
+  local raw pause time duration sock
+  case "$action" in
+    pause)
+      ipc_send '{"command":["set_property","pause",true]}' >/dev/null
+      ;;
+    unpause)
+      ipc_send '{"command":["set_property","pause",false]}' >/dev/null
+      ;;
+    toggle-pause)
+      ipc_send '{"command":["cycle","pause"]}' >/dev/null
+      ;;
+    status)
+      sock=$(ipc_socket) || fail "player is not running"
+      refuse_symlink "$sock"
+      [[ -S $sock ]] || fail "player is not running"
+      raw=$(
+        {
+          "$PRINTF" '%s\n' '{"command":["get_property","pause"]}'
+          "$PRINTF" '%s\n' '{"command":["get_property","playback-time"]}'
+          "$PRINTF" '%s\n' '{"command":["get_property","duration"]}'
+        } | "$NC" -U -N -w "$IPC_TIMEOUT" "$sock"
+      ) || fail "player is not running"
+      pause=$("$PRINTF" '%s\n' "$raw" | "$JQ" -s '.[0].data // false')
+      time=$("$PRINTF" '%s\n' "$raw" | "$JQ" -s '(.[1].data // 0) | floor | if . < 0 then 0 else . end')
+      duration=$("$PRINTF" '%s\n' "$raw" | "$JQ" -s '(.[2].data // 0) | floor | if . < 0 then 0 else . end')
+      "$JQ" -nc --argjson pause "$pause" --argjson time "$time" --argjson duration "$duration" \
+        '{pause:$pause,time:$time,duration:$duration}'
+      ;;
+    *)
+      fail "ctl must be pause, unpause, toggle-pause, or status"
+      ;;
   esac
 }
 
@@ -448,6 +649,16 @@ case "$cmd" in
   enabled)
     shift
     enabled_state "${1:-}"
+    ;;
+  restore)
+    restore_intent
+    ;;
+  live)
+    print_live
+    ;;
+  ctl)
+    shift
+    ctl_player "${1:-}"
     ;;
   -h|--help|help|"")
     usage
