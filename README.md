@@ -2,6 +2,8 @@
 
 Omarchy bar plugin that plays a random [Marc Rebillet](https://www.youtube.com/@MarcRebillet) session, audio only.
 
+See [CHANGELOG.md](CHANGELOG.md) for what’s new.
+
 ## Install
 
 ```sh
